@@ -3,6 +3,11 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from mamba_ssm.utils.torch import custom_bwd, custom_fwd
+from mamba_ssm.ops.selective_scan_mps import (
+    selective_scan_mps,
+    selective_scan_fn_mps,
+    SelectiveScanMPS,
+)
 
 try:
     import causal_conv1d_cuda
@@ -17,6 +22,11 @@ try:
     has_cuda_support = True
 except ImportError:
     has_cuda_support = False
+
+
+def _is_mps_device(tensor):
+    """Check if tensor is on MPS device."""
+    return tensor is not None and tensor.device.type == "mps"
 
 
 def _layer_norm_fwd(x, weight, bias, eps, residual=None, residual_dtype=None, is_rms_norm=False):
@@ -43,6 +53,28 @@ class SelectiveScanFn(torch.autograd.Function):
         delta_softplus=False,
         return_last_state=False,
     ):
+        # Check if we should use MPS implementation
+        use_mps = _is_mps_device(u)
+        
+        if use_mps:
+            # Use MPS-optimized implementation with torch.compile
+            result = selective_scan_fn_mps(
+                u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state,
+                use_compile=True
+            )
+            if return_last_state:
+                out, last_state = result
+                ctx.save_for_backward(u, delta, A, B, C, D, z, delta_bias)
+                ctx.delta_softplus = delta_softplus
+                ctx.has_z = z is not None
+                ctx.last_state = last_state
+                return out, last_state
+            else:
+                ctx.save_for_backward(u, delta, A, B, C, D, z, delta_bias)
+                ctx.delta_softplus = delta_softplus
+                ctx.has_z = z is not None
+                return result
+        
         if not has_cuda_support:
             # Fall back to reference implementation
             out = selective_scan_ref(
@@ -89,10 +121,53 @@ class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        # Check if we have MPS tensors (stored in context)
+        u, delta, A, B, C, D, z, delta_bias = ctx.saved_tensors
+        use_mps = _is_mps_device(u)
+        
+        if use_mps:
+            # MPS backward uses autograd through the compiled forward
+            inputs_to_grad = [u, delta, A, B, C]
+            if D is not None:
+                inputs_to_grad.append(D)
+            if z is not None:
+                inputs_to_grad.append(z)
+            if delta_bias is not None:
+                inputs_to_grad.append(delta_bias)
+            
+            with torch.enable_grad():
+                out = selective_scan_fn_mps(
+                    u, delta, A, B, C, D, z, delta_bias,
+                    ctx.delta_softplus, False, use_compile=True
+                )
+            
+            grads = torch.autograd.grad(
+                outputs=out,
+                inputs=inputs_to_grad,
+                grad_outputs=dout,
+                allow_unused=True,
+                create_graph=False,
+            )
+            
+            # Map gradients back to input order
+            grad_map = [grads[0], grads[1], grads[2], grads[3], grads[4]]
+            if D is not None:
+                grad_map.append(grads[4] if z is None else grads[5])
+            else:
+                grad_map.append(None)
+            if z is not None:
+                grad_map.append(grads[-2] if delta_bias is None else grads[-2])
+            else:
+                grad_map.append(None)
+            if delta_bias is not None:
+                grad_map.append(grads[-1])
+            else:
+                grad_map.append(None)
+            
+            return tuple(grad_map) + (None, None)
+        
         if not has_cuda_support:
             # Use autograd to compute gradients through the reference implementation
-            u, delta, A, B, C, D, z, delta_bias = ctx.saved_tensors
-
             # Set requires_grad on input tensors
             u.requires_grad_(True)
             delta.requires_grad_(True)
@@ -228,10 +303,25 @@ def selective_scan_fn(
     delta_softplus=False,
     return_last_state=False,
 ):
-    """if return_last_state is True, returns (out, last_state)
+    """
+    Selective scan function with device-aware dispatch.
+    
+    Dispatch priority:
+    1. CUDA kernel (selective_scan_cuda) if available and on CUDA device
+    2. MPS optimized (selective_scan_mps with torch.compile) if on MPS device
+    3. Reference Python implementation otherwise
+    
+    if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
+    # Check for MPS device
+    if _is_mps_device(u):
+        return selective_scan_fn_mps(
+            u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state,
+            use_compile=True
+        )
+    
     if not has_cuda_support:
         # Use reference implementation directly so PyTorch can auto-differentiate
         return selective_scan_ref(

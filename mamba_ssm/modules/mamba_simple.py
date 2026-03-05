@@ -6,11 +6,30 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
+from mamba_ssm.ops.causal_conv1d_mps import (
+    causal_conv1d_fn_mps,
+    causal_conv1d_update_mps,
+)
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
+
+
+def _get_causal_conv1d_fn():
+    """
+    Get the appropriate causal conv1d function based on device availability.
+    
+    Priority:
+    1. CUDA kernel (causal_conv1d_fn) if available
+    2. MPS fallback (causal_conv1d_fn_mps) if on MPS device
+    3. None (will use nn.Conv1d fallback)
+    """
+    if causal_conv1d_fn is not None:
+        return causal_conv1d_fn, causal_conv1d_update
+    # MPS fallback will be used when device.type == "mps"
+    return causal_conv1d_fn_mps, causal_conv1d_update_mps
 
 
 class Mamba(nn.Module):
@@ -126,10 +145,14 @@ class Mamba(nn.Module):
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-        # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if (
-            self.use_fast_path and causal_conv1d_fn is not None and inference_params is None
-        ):  # Doesn't support outputting the states
+        
+        # Determine which conv function to use based on device and availability
+        # Priority: CUDA kernel > MPS fallback > nn.Conv1d reference
+        use_cuda_conv = causal_conv1d_fn is not None and inference_params is None and self.use_fast_path
+        use_mps_conv = xz.device.type == "mps"
+        
+        # Fast path with fused mamba_inner_fn (CUDA only)
+        if use_cuda_conv:
             out = mamba_inner_fn(
                 xz,
                 self.conv1d.weight,
@@ -145,23 +168,29 @@ class Mamba(nn.Module):
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
             )
+            return out
+        
+        # Unfused path: conv -> selective_scan
+        x, z = xz.chunk(2, dim=1)
+        
+        # Compute short convolution
+        if conv_state is not None:
+            conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))
+        
+        # Select convolution implementation
+        if use_mps_conv or causal_conv1d_fn is not None:
+            # Use optimized kernel (MPS or CUDA)
+            assert self.activation in ["silu", "swish"]
+            conv_fn = causal_conv1d_fn_mps if use_mps_conv else causal_conv1d_fn
+            x = conv_fn(
+                x=x,
+                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+            )
         else:
-            x, z = xz.chunk(2, dim=1)
-            # Compute short convolution
-            if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-            if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                x = causal_conv1d_fn(
-                    x=x,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                )
+            # Fallback to nn.Conv1d + activation
+            x = self.act(self.conv1d(x)[..., :seqlen])
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
@@ -198,24 +227,29 @@ class Mamba(nn.Module):
         xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
         x, z = xz.chunk(2, dim=-1)  # (B D)
 
-        # Conv step
-        if causal_conv1d_update is None:
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
-            conv_state[:, :, -1] = x
-            x = torch.sum(
-                conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
-            )  # (B D)
-            if self.conv1d.bias is not None:
-                x = x + self.conv1d.bias
-            x = self.act(x).to(dtype=dtype)
-        else:
-            x = causal_conv1d_update(
+        # Conv step - select implementation based on device
+        use_mps = x.device.type == "mps"
+        
+        if use_mps or causal_conv1d_update is not None:
+            # Use optimized update kernel (MPS or CUDA)
+            conv_update_fn = causal_conv1d_update_mps if use_mps else causal_conv1d_update
+            x = conv_update_fn(
                 x,
                 conv_state,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
                 self.activation,
             )
+        else:
+            # Fallback: manual state update + conv
+            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+            conv_state[:, :, -1] = x
+            x = torch.sum(
+                conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+            )
+            if self.conv1d.bias is not None:
+                x = x + self.conv1d.bias
+            x = self.act(x).to(dtype=dtype)
 
         x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)

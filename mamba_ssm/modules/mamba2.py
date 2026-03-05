@@ -5,6 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from mamba_ssm.ops.causal_conv1d_mps import causal_conv1d_fn_mps
+from mamba_ssm.ops.mamba2_chunk_scan_mps import mamba_chunk_scan_combined_mps
+
 try:
     from causal_conv1d import causal_conv1d_fn
 except ImportError:
@@ -12,7 +15,13 @@ except ImportError:
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+    from mamba_ssm.ops.triton.ssd_combined import (
+        mamba_split_conv1d_scan_combined,
+    )
+    USE_OPTIMIZED_KERNELS = True
 except ImportError:
+    USE_OPTIMIZED_KERNELS = False
+    mamba_split_conv1d_scan_combined = None
 
     class RMSNormGated(nn.Module):
         def __init__(self, d, eps=1e-5, norm_before_gate=False, device=None, dtype=None):
@@ -29,60 +38,6 @@ except ImportError:
             if z is not None and self.norm_before_gate:
                 x_norm = x_norm * F.silu(z)
             return x_norm
-
-
-try:
-    from mamba_ssm.ops.triton.ssd_combined import (
-        mamba_chunk_scan_combined,
-        mamba_split_conv1d_scan_combined,
-    )
-
-    USE_OPTIMIZED_KERNELS = True
-except ImportError:
-    USE_OPTIMIZED_KERNELS = False
-
-    def mamba_chunk_scan_combined(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        chunk_size=256,
-        D=None,
-        z=None,
-        seq_idx=None,
-        initial_states=None,
-        **kwargs,
-    ):
-        batch, seqlen, nheads, headdim = x.shape
-        ngroups = B.shape[2] if B.ndim > 3 else 1
-
-        if ngroups < nheads:
-            heads_per_group = nheads // ngroups
-            B = repeat(B, "b l g d -> b l (g h) d", h=heads_per_group)
-            C = repeat(C, "b l g d -> b l (g h) d", h=heads_per_group)
-
-        dA = torch.einsum("blh,h->blh", dt, A)
-        dB_u = torch.einsum("blh,blhp,blhn->blhpn", dt, x, B)
-
-        dA_padded = F.pad(dA[:, 1:], (0, 0, 0, 1))
-        dA_cumsum = dA_padded.flip(1).cumsum(1).flip(1)
-        dA_cumsum_exp = torch.exp(dA_cumsum)
-
-        dA_cumsum_expanded = dA_cumsum_exp.unsqueeze(-1).unsqueeze(-1)
-        x_scaled = dB_u * dA_cumsum_expanded
-        x_cumsum = x_scaled.cumsum(1)
-        states = x_cumsum / (dA_cumsum_expanded + 1e-12)
-
-        y = torch.einsum("blhpn,blhn->blhp", states, C)
-
-        if D is not None:
-            y = y + x * D.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
-
-        return y
-
-    def mamba_split_conv1d_scan_combined(*args, **kwargs):
-        raise NotImplementedError("Reference implementation not available for split conv1d scan")
 
 
 class Mamba2(nn.Module):
@@ -225,15 +180,19 @@ class Mamba2(nn.Module):
         )
         dt = F.softplus(dt + self.dt_bias)
 
-        if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
-            xBC = self.act(self.conv1d(xBC.transpose(1, 2)).transpose(1, 2))[:, :seqlen, :]
-        else:
-            xBC = causal_conv1d_fn(
+        # Use MPS-optimized causal conv or fallback
+        use_mps = xBC.device.type == "mps"
+        
+        if use_mps or (causal_conv1d_fn is not None and self.activation in ["silu", "swish"]):
+            conv_fn = causal_conv1d_fn_mps if use_mps else causal_conv1d_fn
+            xBC = conv_fn(
                 xBC.transpose(1, 2),
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
                 self.activation,
             ).transpose(1, 2)
+        else:
+            xBC = self.act(self.conv1d(xBC.transpose(1, 2)).transpose(1, 2))[:, :seqlen, :]
 
         x, B, C = torch.split(
             xBC,
@@ -241,7 +200,8 @@ class Mamba2(nn.Module):
             dim=-1,
         )
 
-        y = mamba_chunk_scan_combined(
+        # Use MPS-optimized chunk scan or fallback
+        y = mamba_chunk_scan_combined_mps(
             rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
             dt,
             A,
@@ -252,7 +212,7 @@ class Mamba2(nn.Module):
             z=None,
             seq_idx=seq_idx,
             initial_states=initial_states,
-            **dt_limit_kwargs,
+            dt_limit=self.dt_limit,
         )
 
         y = rearrange(y, "b l h p -> b l (h p)")
