@@ -242,8 +242,13 @@ class Mamba(nn.Module):
             )
         else:
             # Fallback: manual state update + conv
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
-            conv_state[:, :, -1] = x
+            # MPS-optimized: avoid torch.roll which creates intermediate tensor
+            if x.device.type == "mps":
+                conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
+                conv_state[:, :, -1] = x
+            else:
+                conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+                conv_state[:, :, -1] = x
             x = torch.sum(
                 conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
             )

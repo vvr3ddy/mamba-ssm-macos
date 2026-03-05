@@ -23,12 +23,26 @@ from mamba_ssm.utils.macos import (
     get_optimal_dtype,
     load_and_prepare_model,
 )
+from mamba_ssm.utils.profiling import (
+    mps_memory_tracker,
+    get_mps_memory_info,
+    profile_forward_pass,
+    benchmark_sequence_lengths,
+    mps_profiler,
+)
 from mamba_ssm.utils.torch import (
     autocast_context,
     custom_bwd,
     custom_fwd,
     get_amp_dtype,
     get_autocast_device_type,
+)
+from mamba_ssm.utils.profiling import (
+    mps_memory_tracker,
+    get_mps_memory_info,
+    profile_forward_pass,
+    benchmark_sequence_lengths,
+    mps_profiler,
 )
 
 __all__ = [
@@ -49,4 +63,10 @@ __all__ = [
     "custom_fwd",
     "get_amp_dtype",
     "get_autocast_device_type",
+    # Profiling utilities
+    "mps_memory_tracker",
+    "get_mps_memory_info",
+    "profile_forward_pass",
+    "benchmark_sequence_lengths",
+    "mps_profiler",
 ]

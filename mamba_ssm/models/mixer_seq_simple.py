@@ -121,10 +121,12 @@ class MixerModel(nn.Module):
         residual_in_fp32=False,
         device=None,
         dtype=None,
+        gradient_checkpointing: bool = False,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
+        self.gradient_checkpointing = gradient_checkpointing
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
         self.layers = nn.ModuleList(
             [
@@ -163,16 +165,27 @@ class MixerModel(nn.Module):
         hidden_states = self.embedding(input_ids)
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
-            )
+            if self.gradient_checkpointing and self.training and inference_params is None:
+                # Gradient checkpointing: recompute activations during backward
+                # Use torch.utils.checkpoint.checkpoint on the layer module directly
+                hidden_states, residual = torch.utils.checkpoint.checkpoint(
+                    lambda h, r, ip: layer(h, r, inference_params=ip, **mixer_kwargs),
+                    hidden_states,
+                    residual,
+                    inference_params,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, residual = layer(
+                    hidden_states, residual, inference_params=inference_params, **mixer_kwargs
+                )
         residual = (hidden_states + residual) if residual is not None else hidden_states
         hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         return hidden_states
 
 
 class MambaLMHeadModel(nn.Module, GenerationMixin):
-    def __init__(self, config: MambaConfig, initializer_cfg=None, device=None, dtype=None) -> None:
+    def __init__(self, config: MambaConfig, initializer_cfg=None, device=None, dtype=None, gradient_checkpointing: bool = False) -> None:
         self.config = config
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -191,6 +204,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             attn_cfg=config.attn_cfg,
             initializer_cfg=initializer_cfg,
             residual_in_fp32=config.residual_in_fp32,
+            gradient_checkpointing=gradient_checkpointing,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(config.d_model, vocab_size, bias=False, **factory_kwargs)

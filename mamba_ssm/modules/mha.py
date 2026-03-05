@@ -321,10 +321,15 @@ class MHA(nn.Module):
                 qkv = qkv.squeeze(1)
                 # Conv step
                 if causal_conv1d_update is None:
-                    conv_state.copy_(
-                        torch.roll(conv_state, shifts=-1, dims=-1)
-                    )  # Update state (B D W)
-                    conv_state[:, :, -1] = qkv
+                    # MPS-optimized: avoid torch.roll which creates intermediate tensor
+                    if qkv.device.type == "mps":
+                        conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
+                        conv_state[:, :, -1] = qkv
+                    else:
+                        conv_state.copy_(
+                            torch.roll(conv_state, shifts=-1, dims=-1)
+                        )  # Update state (B D W)
+                        conv_state[:, :, -1] = qkv
                     qkv = torch.sum(
                         conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"),
                         dim=-1,
