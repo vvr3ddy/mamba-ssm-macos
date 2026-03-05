@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: macos-latest
+    runs-on: macos-15  # M4 Mac with Metal support
     steps:
       - uses: actions/checkout@v4
 
@@ -22,4 +22,7 @@ jobs:
         run: uv sync
 
       - name: Run unit tests
-        run: uv run python -m tests.run_unit_tests
+        run: uv run python -m unittest discover -s tests.unit -v
+
+      - name: Run integration tests
+        run: uv run python -m unittest tests.integration.test_unified_system -v
