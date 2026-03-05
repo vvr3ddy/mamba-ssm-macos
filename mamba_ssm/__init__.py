@@ -15,11 +15,20 @@ from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
+from mamba_ssm.utils.generation import InferenceParams
 from mamba_ssm.utils.macos import (
     create_tokenizer,
     generate_text_with_model,
     get_device,
+    get_optimal_dtype,
     load_and_prepare_model,
+)
+from mamba_ssm.utils.torch import (
+    autocast_context,
+    custom_bwd,
+    custom_fwd,
+    get_amp_dtype,
+    get_autocast_device_type,
 )
 
 __all__ = [
@@ -28,8 +37,16 @@ __all__ = [
     "Mamba",
     "Mamba2",
     "MambaLMHeadModel",
+    "InferenceParams",
     "get_device",
+    "get_optimal_dtype",
     "create_tokenizer",
     "generate_text_with_model",
     "load_and_prepare_model",
+    # Torch utilities
+    "autocast_context",
+    "custom_bwd",
+    "custom_fwd",
+    "get_amp_dtype",
+    "get_autocast_device_type",
 ]

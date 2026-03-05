@@ -1,4 +1,6 @@
 import math
+from contextlib import nullcontext
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -19,6 +21,46 @@ try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
+
+
+def _get_sdpa_context(device: str = "auto", enable_math: bool = True, enable_mem_efficient: bool = True):
+    """
+    Get the appropriate sdp_context for scaled_dot_product_attention.
+    
+    On MPS, we need to explicitly enable the math backend since flash attention
+    is not available.
+    
+    Args:
+        device: Device ("auto", "cuda", "mps", "cpu")
+        enable_math: Enable math backend
+        enable_mem_efficient: Enable memory-efficient backend
+    
+    Returns:
+        Context manager for sdp_kernel
+    """
+    if device == "auto":
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+    
+    if device == "mps":
+        # On MPS, use math backend only (flash is not available)
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_math=True,
+            enable_mem_efficient=False,
+        )
+    elif device == "cuda":
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=enable_mem_efficient,
+            enable_math=enable_math,
+            enable_mem_efficient=enable_mem_efficient,
+        )
+    else:
+        return nullcontext()
 
 
 def _update_kv_cache(kv, inference_params, layer_idx):
@@ -191,13 +233,15 @@ class MHA(nn.Module):
             k, v = kv.unbind(dim=-3)
             k = torch.repeat_interleave(k, dim=2, repeats=self.num_heads // self.num_heads_kv)
             v = torch.repeat_interleave(v, dim=2, repeats=self.num_heads // self.num_heads_kv)
-            return F.scaled_dot_product_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                is_causal=self.causal,
-                scale=self.softmax_scale,
-            ).transpose(1, 2)
+            # Use sdp context for optimal backend selection
+            with _get_sdpa_context() if q.device.type != "cpu" else nullcontext():
+                return F.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    is_causal=self.causal,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
         else:
             batch = q.shape[0]
             kv_cache, _ = inference_params.key_value_memory_dict[self.layer_idx]
